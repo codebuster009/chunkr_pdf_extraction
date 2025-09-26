@@ -1,31 +1,32 @@
-# chunkr_client.py
-import base64
+# app/chunkr_client.py
 import json
-import asyncio
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Optional
 
 import httpx
+from httpx import HTTPStatusError
 from .config import settings
 
-# New API (JSON body) – kept for general parsing if needed
-CHUNKR_BASE_URL = "https://api.chunkr.ai"
-PARSE_ENDPOINT = "/api/v1/tasks/parse"
-TASK_STATUS_ENDPOINT = "/api/v1/tasks/{task_id}"
+# SDK (from docs): used for quick upload/poll sanity checks
+try:
+    from chunkr_ai import Chunkr
+except Exception:  # pragma: no cover
+    Chunkr = None  # optional
 
-# Legacy API (multipart form) – supports json_schema + instructions
-CHUNKR_LEGACY_BASE_URL = "https://legacy-api.chunkr.ai"
+
+# ----- Legacy endpoints (needed for structured extraction with schema+instructions) -----
+CHUNKR_LEGACY_BASE_URL = (settings.URL.rstrip("/") if settings.URL else "https://legacy-api.chunkr.ai")
 LEGACY_CREATE_ENDPOINT = "/api/v1/task"
 LEGACY_STATUS_ENDPOINT = "/api/v1/task/{task_id}"
 
-AIRLINE_JSON_SCHEMA = {
+
+# ======== Your structured schema & instructions ========
+AIRLINE_JSON_SCHEMA: Dict[str, Any] = {
     "title": "AirfreightRateEmail",
     "type": "object",
     "properties": [
         {"name": "valid_until", "type": "string", "description": "YYYY-MM-DD or empty string"},
         {"name": "currency", "type": "string", "description": "3-letter code or symbol, or empty string"},
-
-        # Flattened dot-path properties (so we can reconstruct nesting)
-        # Rates buckets
         {"name": "rates.stackable.per_kg", "type": "string"},
         {"name": "rates.stackable.min_charge", "type": "string"},
         {"name": "rates.non-stackable.per_kg", "type": "string"},
@@ -36,14 +37,10 @@ AIRLINE_JSON_SCHEMA = {
         {"name": "rates.mix.min_charge", "type": "string"},
         {"name": "rates.general.per_kg", "type": "string"},
         {"name": "rates.general.min_charge", "type": "string"},
-
-        # Screening
         {"name": "screeningPrices.primaryScreeningPrice.per_kg", "type": "string"},
         {"name": "screeningPrices.primaryScreeningPrice.min_charge", "type": "string"},
         {"name": "screeningPrices.secondaryScreeningPrice.per_kg", "type": "string"},
         {"name": "screeningPrices.secondaryScreeningPrice.min_charge", "type": "string"},
-
-        # FFWH
         {"name": "FFWH.fuelSurcharge.per_kg", "type": "string"},
         {"name": "FFWH.fuelSurcharge.min_charge", "type": "string"},
         {"name": "FFWH.freightCharge.per_kg", "type": "string"},
@@ -86,102 +83,83 @@ RULES:
 
 - Do not invent values. Do not emit extra keys. Output must be valid JSON per the schema."""
 
-class ChunkrHttpClient:
-    def __init__(self, api_key: str, base_url: str = CHUNKR_BASE_URL) -> None:
+
+class ChunkrLegacyClient:
+    def __init__(self, api_key: str, base_url: str):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
 
-    # -------- NEW API (kept) --------
-    def _headers(self) -> Dict[str, str]:
-        # Docs: Authorization is the raw API key (no "Bearer")
-        return {"Authorization": self.api_key, "Content-Type": "application/json"}
-
-    async def create_parse_task(self, file_bytes: bytes, filename: str) -> str:
-        payload = {
-            "file": base64.b64encode(file_bytes).decode("utf-8"),
-            "file_name": filename[:255],
-        }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{self.base_url}{PARSE_ENDPOINT}", json=payload, headers=self._headers()
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        task_id = data.get("task_id") or data.get("id") or (data.get("task") or {}).get("id")
-        if not task_id:
-            raise RuntimeError("Chunkr: missing task id in response")
-        return task_id
-
-    async def poll_task_until_complete(
-        self, task_id: str, *, max_tries: int = 60, delay_seconds: float = 2.0
-    ) -> Dict[str, Any]:
-        url = f"{self.base_url}{TASK_STATUS_ENDPOINT.format(task_id=task_id)}"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for _ in range(max_tries):
-                resp = await client.get(url, headers=self._headers())
-                if resp.status_code == 401:
-                    raise PermissionError("Chunkr unauthorized (401) - check API key")
-                if resp.status_code == 404:
-                    await asyncio.sleep(delay_seconds)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                status_value = data.get("status") or data.get("state")
-                if status_value in {"completed", "done", "Succeeded"} or data.get("output") or data.get("extracted_json"):
-                    return data
-                if status_value in {"failed", "error", "Failed"}:
-                    raise RuntimeError(f"Chunkr task failed: {data}")
-                await asyncio.sleep(delay_seconds)
-        raise TimeoutError("Chunkr task poll timed out")
-
-    # -------- LEGACY API (structured extraction) --------
     def _legacy_headers(self) -> Dict[str, str]:
-        # legacy also expects raw API key
+        # Per docs: raw API key (no "Bearer")
         return {"Authorization": self.api_key}
 
     async def create_structured_task_legacy(self, file_bytes: bytes, filename: str) -> str:
         """
-        POST multipart form with:
-          file, model, ocr_strategy, json_schema (as JSON string), instructions (text)
+        POST multipart with explicit content-types:
+          - file: application/pdf
+          - json_schema: application/json
+          - instructions: text/plain
+        Includes retry/backoff for 502/503/504.
         """
         files = {
-            "file": (filename, file_bytes, "application/octet-stream"),
+            "file": (filename, file_bytes, "application/pdf"),
+            "json_schema": ("json_schema", json.dumps(AIRLINE_JSON_SCHEMA), "application/json"),
+            "instructions": ("instructions", AIRLINE_INSTRUCTIONS, "text/plain"),
         }
-        data = {
-            "model": "Fast",
-            "ocr_strategy": "Auto",
-            "json_schema": json.dumps(AIRLINE_JSON_SCHEMA),
-            "instructions": AIRLINE_INSTRUCTIONS,
-        }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{CHUNKR_LEGACY_BASE_URL}{LEGACY_CREATE_ENDPOINT}",
-                headers=self._legacy_headers(),
-                files=files,
-                data=data,
-            )
-        resp.raise_for_status()
-        payload = resp.json()
-        task_id = payload.get("task_id") or payload.get("id") or (payload.get("task") or {}).get("id")
-        if not task_id:
-            raise RuntimeError(f"Chunkr legacy: missing task id in response: {payload}")
-        return task_id
+        data = {"model": "Fast", "ocr_strategy": "Auto"}
+
+        max_attempts = 5
+        backoff = 1.0
+        last_err = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+                    resp = await client.post(
+                        f"{self.base_url}{LEGACY_CREATE_ENDPOINT}",
+                        headers=self._legacy_headers(),
+                        data=data,
+                        files=files,
+                    )
+                resp.raise_for_status()
+                payload = resp.json()
+                task_id = payload.get("task_id") or payload.get("id") or (payload.get("task") or {}).get("id")
+                if not task_id:
+                    raise RuntimeError(f"Chunkr legacy: missing task id in response: {payload}")
+                return task_id
+            except HTTPStatusError as e:
+                code = e.response.status_code
+                last_err = f"{code}: {(e.response.text or '')[:500]}"
+                if code in (502, 503, 504) and attempt < max_attempts:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 8)
+                    continue
+                raise
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_attempts:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 8)
+                    continue
+                raise RuntimeError(f"Chunkr legacy create failed after retries. Last error: {last_err}")
 
     async def poll_task_until_complete_legacy(
-        self, task_id: str, *, max_tries: int = 90, delay_seconds: float = 2.0
+        self,
+        task_id: str,
+        *,
+        max_tries: int = 120,
+        delay_seconds: float = 2.0,
     ) -> Dict[str, Any]:
-        url = f"{CHUNKR_LEGACY_BASE_URL}{LEGACY_STATUS_ENDPOINT.format(task_id=task_id)}"
+        url = f"{self.base_url}{LEGACY_STATUS_ENDPOINT.format(task_id=task_id)}"
         async with httpx.AsyncClient(timeout=30.0) as client:
             for _ in range(max_tries):
                 resp = await client.get(url, headers=self._legacy_headers())
                 if resp.status_code == 401:
                     raise PermissionError("Chunkr legacy unauthorized (401) - check API key")
-                if resp.status_code == 404:
-                    await asyncio.sleep(delay_seconds)
-                    continue
                 resp.raise_for_status()
                 data = resp.json()
-                status_value = data.get("status")
+                status_value = data.get("status") or data.get("state")
+                # legacy structured: expect 'extracted_json' when done
                 if status_value in {"completed", "done", "Succeeded"} or data.get("extracted_json"):
                     return data
                 if status_value in {"failed", "error", "Failed"}:
@@ -190,10 +168,27 @@ class ChunkrHttpClient:
         raise TimeoutError("Chunkr legacy task poll timed out")
 
 
-client_instance: Optional[ChunkrHttpClient] = None
+# Singleton(s)
+_legacy_client: Optional[ChunkrLegacyClient] = None
+_sdk_client: Optional["Chunkr"] = None
 
-def get_client() -> ChunkrHttpClient:
-    global client_instance
-    if client_instance is None:
-        client_instance = ChunkrHttpClient(api_key=settings.API_KEY)
-    return client_instance
+
+def get_legacy_client() -> ChunkrLegacyClient:
+    global _legacy_client
+    if _legacy_client is None:
+        _legacy_client = ChunkrLegacyClient(api_key=settings.API_KEY, base_url=CHUNKR_LEGACY_BASE_URL)
+    return _legacy_client
+
+
+def get_sdk_client() -> Optional["Chunkr"]:
+    # Optional helper to confirm connectivity via official SDK (no schema)
+    global _sdk_client
+    if Chunkr is None:
+        return None
+    if _sdk_client is None:
+        # From docs: can pass api_key and custom URL via env or params
+        if settings.URL:
+            _sdk_client = Chunkr(api_key=settings.API_KEY, chunkr_url=settings.URL, raise_on_failure=settings.RAISE_ON_FAILURE)
+        else:
+            _sdk_client = Chunkr(api_key=settings.API_KEY, raise_on_failure=settings.RAISE_ON_FAILURE)
+    return _sdk_client
