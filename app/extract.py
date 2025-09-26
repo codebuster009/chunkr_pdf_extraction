@@ -1,10 +1,8 @@
-# extract.py
+# app/extract.py
 import json
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
-
-# ===== Helpers to reconstruct nested dict from Chunkr `extracted_json` =====
 
 def _set_in(d: Dict[str, Any], path: List[str], value: Any) -> None:
     cur = d
@@ -15,10 +13,6 @@ def _set_in(d: Dict[str, Any], path: List[str], value: Any) -> None:
     cur[path[-1]] = value
 
 def _dotpaths_to_nested(extracted_fields: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Convert [{"name": "rates.general.per_kg", "value": "0.60"}, ...] into nested dict.
-    Values remain strings ("null" for nulls, "" for empty strings).
-    """
     out: Dict[str, Any] = {}
     for f in extracted_fields or []:
         name = f.get("name")
@@ -30,60 +24,36 @@ def _dotpaths_to_nested(extracted_fields: List[Dict[str, Any]]) -> Dict[str, Any
     return out
 
 def _string_num_or_none(v: Optional[str]) -> Optional[str]:
-    """
-    The schema asks numerics be strings with a number or "null".
-    Keep as-is; your downstream already converts safely.
-    """
     if v is None:
         return "null"
     s = str(v).strip()
     return s if s != "" else "null"
 
-# ===== Date normalization (for relative valid_until like "+14 Days") =====
-
-REF_DATE = datetime(2025, 9, 23)  # per your rule in prompt
+REF_DATE = datetime(2025, 9, 23)  # reference date used for relative validity like "+14 days"
 
 def _normalize_valid_until(v: str) -> str:
     if not v:
         return ""
     s = v.strip()
-    # If already YYYY-MM-DD, accept
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
-    # Patterns like +14 Days, +7 Day, +30 days
     m = re.match(r"^\+(\d{1,3})\s*day[s]?$", s, re.I)
     if m:
         days = int(m.group(1))
         dt = REF_DATE + timedelta(days=days)
         return dt.strftime("%Y-%m-%d")
-    # Try common absolute forms and convert to YYYY-MM-DD
     for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except Exception:
             pass
-    return s  # fallback unchanged
-
-# ===== Main: transform Chunkr task -> your OUTPUT SCHEMA =====
+    return s
 
 def extract_airline_rate_fields(chunkr_response: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reads `extracted_json` from the legacy structured extraction and rebuilds
-    your target object:
-
-    {
-      "valid_until": "",
-      "currency": "",
-      "rates": {...},
-      "screeningPrices": {...},
-      "FFWH": {...}
-    }
-    """
-    ej = chunkr_response.get("extracted_json") or {}
+    ej = (chunkr_response or {}).get("extracted_json") or {}
     fields = ej.get("extracted_fields") or []
     flat = _dotpaths_to_nested(fields)
 
-    # Build final with defaults
     def mk_rate(node: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "per_kg": _string_num_or_none(node.get("per_kg", "")),
@@ -111,5 +81,4 @@ def extract_airline_rate_fields(chunkr_response: Dict[str, Any]) -> Dict[str, An
             "handlingFee":       mk_rate(flat.get("FFWH", {}).get("handlingFee", {}) if isinstance(flat.get("FFWH", {}), dict) else {}),
         },
     }
-
     return result
