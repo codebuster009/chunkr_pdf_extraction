@@ -179,16 +179,28 @@ def get_legacy_client() -> ChunkrLegacyClient:
         _legacy_client = ChunkrLegacyClient(api_key=settings.API_KEY, base_url=CHUNKR_LEGACY_BASE_URL)
     return _legacy_client
 
+def get_sdk_client() -> Chunkr:
+    """Initialize Chunkr SDK client with API key (and optional custom URL)."""
+    import httpx
 
-def get_sdk_client() -> Optional["Chunkr"]:
-    # Optional helper to confirm connectivity via official SDK (no schema)
-    global _sdk_client
-    if Chunkr is None:
-        return None
-    if _sdk_client is None:
-        # From docs: can pass api_key and custom URL via env or params
-        if settings.URL:
-            _sdk_client = Chunkr(api_key=settings.API_KEY, chunkr_url=settings.URL, raise_on_failure=settings.RAISE_ON_FAILURE)
-        else:
-            _sdk_client = Chunkr(api_key=settings.API_KEY, raise_on_failure=settings.RAISE_ON_FAILURE)
-    return _sdk_client
+    timeout = httpx.Timeout(
+        connect=30.0,  # give DNS/connect plenty of time
+        read=300.0,    # wait up to 5 min for full response
+        write=300.0,   # allow long uploads
+        pool=300.0,
+    )
+
+    transport = httpx.AsyncHTTPTransport(retries=2)
+    http_client = httpx.AsyncClient(timeout=timeout, transport=transport)
+
+    kwargs = {
+        "api_key": settings.API_KEY,
+        "raise_on_failure": True,
+        "client": http_client,
+    }
+    if getattr(settings, "URL", None):
+        kwargs["chunkr_url"] = settings.URL
+
+    return Chunkr(**kwargs)
+
+
