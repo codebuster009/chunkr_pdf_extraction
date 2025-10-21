@@ -1,6 +1,5 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Query
 from fastapi.responses import Response
-from chunkr_ai import Chunkr
 import tempfile
 import os
 import json
@@ -9,194 +8,137 @@ from typing import Optional, Any, Dict
 import httpx
 import asyncio
 
-from .extract_v2 import extract_airline_from_chunks
+from app.schemas.airline_rate_extract import AirlineRateExtract  # ✅ NEW SCHEMA CLASS
 
 router = APIRouter()
 log = logging.getLogger("chunkr_service")
 
-
-# -------------------------------------------------------------------
-# 1️⃣  Initialize Chunkr client
-# -------------------------------------------------------------------
-def get_sdk_client() -> Chunkr:
-    """Initialize Chunkr SDK client with API key and extended timeouts."""
-    API_KEY = "ch_8U2hBpgPC85_4v7RuDVtzq4aUg8zerbSC24DDWWaZEcTx"  # TEMP local test key
-
-    kwargs = {
-        "api_key": API_KEY,
-        "raise_on_failure": True,
-    }
-
-    client = Chunkr(**kwargs)
-
-    if hasattr(client, "_client"):
-        timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=300.0, pool=30.0)
-        client._client = httpx.AsyncClient(
-            timeout=timeout,
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        )
-    return client
+# ====== CONFIG ======
+CHUNKR_API_KEY = "ch_8U2hBpgPC85_4v7RuDVtzq4aUg8zerbSC24DDWWaZEcTx"  # TEMP for local testing
+CHUNKR_BASE = "https://api.chunkr.ai"
 
 
-# -------------------------------------------------------------------
-# 2️⃣  Utility: Safely parse Chunkr SDK output
-# -------------------------------------------------------------------
-def _output_to_dict(output: Any) -> Dict[str, Any]:
-    """Coerce Chunkr SDK `output` into a python dict."""
-    if hasattr(output, "json") and callable(output.json):
-        data = output.json()
-        if isinstance(data, (dict, list)):
-            return data if isinstance(data, dict) else {"chunks": data}
-        if isinstance(data, str):
-            return json.loads(data)
-    if isinstance(output, dict):
-        return output
-    if isinstance(output, str):
-        return json.loads(output)
-    raise TypeError(f"Unsupported output type: {type(output).__name__}")
+def _build_schema() -> Dict[str, Any]:
+    """Build the JSON schema for the Extract API."""
+    return AirlineRateExtract.model_json_schema()  # ✅ FIXED class name
 
 
-# -------------------------------------------------------------------
-# 3️⃣  Main upload + polling endpoint
-# -------------------------------------------------------------------
+def _json(obj: Any) -> str:
+    """Pretty-print JSON for responses."""
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
 @router.post("/process/file")
 async def process_file(
     file: UploadFile = File(...),
     raw: Optional[str] = Query(
         default=None,
-        description="Debug: 'all' to return full Chunkr output; 'chunks' to return only chunks."
+        description="Debug: 'results' to return only results; 'all' to return full output."
     ),
 ) -> Response:
-    sdk = get_sdk_client()
     tmp_path = None
-    API_KEY = "ch_8U2hBpgPC85_4v7RuDVtzq4aUg8zerbSC24DDWWaZEcTx"
-
     try:
-        log.info("📄 Received file: %s (content-type: %s)", file.filename, file.content_type)
-
-        # Save upload to temp file
+        # 1️⃣ Save upload locally
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
-            log.info("💾 Saved to temp file: %s (%d bytes)", tmp_path, len(content))
+            log.info("📄 Saved upload to %s (%d bytes)", tmp_path, len(content))
 
-        # Create task using SDK
-        log.info("🚀 Creating Chunkr task...")
-        task = await sdk.create_task(tmp_path)
+        # 2️⃣ Upload to Chunkr /files → get file_url
+        headers = {"Authorization": CHUNKR_API_KEY}
+        timeout = httpx.Timeout(60.0, connect=10.0)
 
-        # Extract and log task ID
-        task_id = getattr(task, "id", None) or getattr(task, "task_id", None)
-        if not task_id:
-            raise RuntimeError("Could not determine Chunkr task ID after creation")
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            files = {"file": (os.path.basename(tmp_path), open(tmp_path, "rb"), "application/pdf")}
+            up = await client.post(f"{CHUNKR_BASE}/files", files=files)
 
-        log.info("✅ Task created successfully → Task ID: %s", task_id)
-        print(f"🧩 [DEBUG] Created Chunkr Task ID: {task_id}")
+            if up.status_code == 401:
+                raise HTTPException(status_code=401, detail="Invalid or expired Chunkr API key")
 
-        # -------------------------------------------------------------------
-        # Poll manually via REST API (correct URL + header confirmed)
-        # -------------------------------------------------------------------
-        max_wait_seconds = 360  # 6 minutes max
-        poll_interval = 10      # poll every 10 seconds
+            up.raise_for_status()
+            file_url = up.json().get("url")
+
+            if not file_url:
+                raise HTTPException(status_code=502, detail="Chunkr /files did not return a file URL")
+
+        log.info("✅ File uploaded successfully: %s", file_url)
+
+        # 3️⃣ Create Extract task with schema
+        schema = _build_schema()
+        payload = {"file": file_url, "schema": schema}
+
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            create = await client.post(f"{CHUNKR_BASE}/tasks/extract", json=payload)
+
+            if create.status_code == 401:
+                raise HTTPException(status_code=401, detail="Invalid or expired Chunkr API key")
+
+            create.raise_for_status()
+            task_id = create.json().get("task_id")
+
+            if not task_id:
+                raise HTTPException(status_code=502, detail="Chunkr did not return task_id")
+
+        log.info("🚀 Created Extract task: %s", task_id)
+
+        # 4️⃣ Poll /tasks/{task_id} until done
+        max_wait_seconds = 360
+        poll_interval = 10
         elapsed = 0
         result = None
 
-        log.info("⏳ Polling Chunkr task %s for completion (max %ds)...", task_id, max_wait_seconds)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), headers=headers) as client:
+            while elapsed < max_wait_seconds:
+                r = await client.get(f"{CHUNKR_BASE}/tasks/{task_id}")
 
-        while elapsed < max_wait_seconds:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(60.0, connect=10.0),
-                headers={"Authorization": API_KEY, "accept": "application/json"}
-            ) as client:
-                resp = await client.get(f"https://api.chunkr.ai/tasks/{task_id}")
-                log.info("🌐 Polled task %s → HTTP %d", task_id, resp.status_code)
-
-                if resp.status_code == 401:
+                if r.status_code == 401:
                     raise HTTPException(status_code=401, detail="Invalid or expired Chunkr API key")
 
-                resp.raise_for_status()
-                data = resp.json()
-                status = data.get("status") or data.get("state")
-                log.info("🌀 Task %s current status: %s", task_id, status)
+                r.raise_for_status()
+                j = r.json()
+                status = j.get("status") or j.get("state")
+
+                log.info("⏳ Task %s status: %s", task_id, status)
 
                 if status in ("Succeeded", "completed", "done"):
-                    log.info("✅ Task %s succeeded after %d seconds", task_id, elapsed)
-                    result = data
+                    result = j
                     break
-                elif status in ("Failed", "Error", "Cancelled"):
-                    raise HTTPException(status_code=502, detail=f"Chunkr task failed: {data}")
+                if status in ("Failed", "Error", "Cancelled"):
+                    raise HTTPException(status_code=502, detail=f"Chunkr task failed: {j}")
 
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
 
         if not result:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Chunkr task {task_id} did not complete within {max_wait_seconds} seconds."
-            )
+            raise HTTPException(status_code=504, detail=f"Chunkr task {task_id} timed out")
 
-        # -------------------------------------------------------------------
-        # Process final result
-        # -------------------------------------------------------------------
-        status = result.get("status") or result.get("state") or "Succeeded"
-        output = result.get("output")
-        if not output:
-            raise HTTPException(status_code=502, detail="No output from Chunkr task response")
+        output = result.get("output") or {}
+        results = output.get("results")
 
-        out_dict = _output_to_dict(output)
+        if results is None:
+            if raw == "all":
+                return Response(content=_json(result), media_type="application/json")
+            raise HTTPException(status_code=502, detail="Chunkr returned no results")
 
-        # Summary logging
-        chunks = out_dict.get("chunks") or []
-        n_chunks = len(chunks) if isinstance(chunks, list) else 0
-        n_segments = sum(len(c.get("segments", [])) for c in chunks) if isinstance(chunks, list) else 0
-        log.info("📊 Chunkr summary: task=%s chunks=%d segments=%d", task_id, n_chunks, n_segments)
-
-        # Optional dump to temp JSON
-        try:
-            fd, dump_path = tempfile.mkstemp(prefix="chunkr_raw_", suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(out_dict, fh, ensure_ascii=False, indent=2)
-            log.info("💾 Wrote full raw Chunkr output to %s", dump_path)
-        except Exception as dbg:
-            log.warning("⚠️ Couldn't write raw dump: %s", dbg)
-
-        # Debug passthrough options
+        # 5️⃣ Debug variants
         if raw == "all":
-            return Response(
-                content=json.dumps(out_dict, ensure_ascii=False, indent=2),
-                media_type="application/json",
-            )
-        if raw == "chunks":
-            only_chunks = out_dict.get("chunks", [])
-            return Response(
-                content=json.dumps(only_chunks, ensure_ascii=False, indent=2),
-                media_type="application/json",
-            )
+            return Response(content=_json(result), media_type="application/json")
+        if raw == "results":
+            return Response(content=_json(results), media_type="application/json")
 
-        # Extract airline information
-        log.info("🔍 Extracting airline information from Chunkr output...")
-        final = extract_airline_from_chunks(out_dict)
+        # 6️⃣ Normal output
+        return Response(content=_json(results), media_type="application/json")
 
-        return Response(
-            content=json.dumps(final, ensure_ascii=False, indent=2),
-            media_type="application/json",
-        )
-
-    # -------------------------------------------------------------------
-    # Error handling + cleanup
-    # -------------------------------------------------------------------
     except HTTPException:
         raise
     except Exception as e:
         log.exception("❌ Error in process_file")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream/parse error: {type(e).__name__}: {repr(e)}",
-        )
+        raise HTTPException(status_code=502, detail=f"Upstream/parse error: {type(e).__name__}: {repr(e)}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
-                log.debug("🗑️ Cleaned up temp file: %s", tmp_path)
-            except Exception as cleanup_err:
-                log.warning("⚠️ Failed to clean up temp file: %s", cleanup_err)
+                log.debug("🧹 Cleaned up temp file: %s", tmp_path)
+            except Exception:
+                pass
